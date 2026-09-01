@@ -1,0 +1,3 @@
+gdstk>=0.9.50
+matplotlib>=3.7
+numpy>=1.24
