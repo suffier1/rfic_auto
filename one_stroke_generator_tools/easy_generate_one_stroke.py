@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import subprocess
 import sys
@@ -16,18 +17,26 @@ TOTAL_COUNT = 1000
 RANDOM_SEED = 8
 OUTPUT_FOLDER_NAME = "one_stroke_gds_seed_8_new"
 MAKE_PNG = False
+FAMILY = "all"  # all / large_rect / deep_loop / serpentine
+START_INDEX = 0  # 같은 seed로 분할 생성할 때 이전 구간 다음 번호
 # ===========================================================================
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="GDS 생성과 전수검사를 순서대로 실행")
+    parser.add_argument("--n", type=int, default=TOTAL_COUNT, help="이 batch에서 생성할 개수")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--family", choices=("all", "large_rect", "deep_loop", "serpentine"), default=FAMILY)
+    parser.add_argument("--start-index", type=int, default=START_INDEX)
+    parser.add_argument("--outdir", type=Path, default=None, help="지정하면 현재 작업 디렉터리 기준 출력 경로")
+    parser.add_argument("--png", action=argparse.BooleanOptionalAction, default=MAKE_PNG)
+    args = parser.parse_args()
     script_dir = Path(__file__).resolve().parent
     generator = script_dir / "generate_one_stroke_gds.py"
     verifier = script_dir / "verify_one_stroke_gds.py"
-    output_dir = script_dir / OUTPUT_FOLDER_NAME
-    if TOTAL_COUNT <= 0:
-        raise ValueError("TOTAL_COUNT는 1 이상이어야 합니다.")
-    if RANDOM_SEED < 0:
-        raise ValueError("RANDOM_SEED는 0 이상이어야 합니다.")
+    output_dir = (args.outdir or script_dir / OUTPUT_FOLDER_NAME).resolve()
+    if args.n <= 0 or args.seed < 0 or args.start_index < 0:
+        parser.error("n은 1 이상, seed와 start-index는 0 이상이어야 합니다.")
     if output_dir.exists():
         raise FileExistsError(
             "같은 출력 디렉터리가 이미 있습니다. 기존 파일을 자동 삭제하지 않습니다.\n"
@@ -39,13 +48,17 @@ def main() -> None:
         sys.executable,
         str(generator),
         "--n",
-        str(TOTAL_COUNT),
+        str(args.n),
         "--seed",
-        str(RANDOM_SEED),
+        str(args.seed),
+        "--family",
+        args.family,
+        "--start-index",
+        str(args.start_index),
         "--outdir",
         str(output_dir),
     ]
-    if not MAKE_PNG:
+    if not args.png:
         generate_command.append("--no-png")
 
     print("[1/2] GDS 생성", flush=True)
@@ -58,7 +71,9 @@ def main() -> None:
             str(verifier),
             str(output_dir),
             "--expected-count",
-            str(TOTAL_COUNT),
+            str(args.n),
+            "--report",
+            str(output_dir / "verification.json"),
         ],
         check=True,
     )

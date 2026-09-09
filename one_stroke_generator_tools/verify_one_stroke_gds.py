@@ -10,6 +10,7 @@ python verify_one_stroke_gds.py ./one_stroke_gds_seed_8_corrected --expected-cou
 from __future__ import annotations
 
 import argparse
+import json
 from collections import Counter, deque
 from pathlib import Path
 import sys
@@ -182,18 +183,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="one-stroke GDS EM 규격 전수검사")
     parser.add_argument("directory", type=Path, help="difftx_*.gds가 있는 디렉토리")
     parser.add_argument("--expected-count", type=int, default=None)
+    parser.add_argument("--report", type=Path, default=None, help="검사 결과 JSON 저장 경로")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     files = sorted(args.directory.glob("difftx_*.gds"))
-    if args.expected_count is not None and len(files) != args.expected_count:
-        print(f"FAIL: GDS 수={len(files)}, expected={args.expected_count}")
-        return 1
-    if not files:
-        print("FAIL: difftx_*.gds가 없습니다.")
-        return 1
+    count_ok = bool(files) and (args.expected_count is None or len(files) == args.expected_count)
 
     failed = []
     for index, path in enumerate(files, 1):
@@ -203,6 +200,18 @@ def main() -> int:
         if index % 100 == 0 or index == len(files):
             print(f"[{index}/{len(files)}] 검사 완료")
 
+    if args.report:
+        report = {
+            "passed": count_ok and not failed,
+            "count": len(files),
+            "expected_count": args.expected_count,
+            "failed": [{"file": p.name, "errors": errors} for p, errors in failed],
+            "scope": "GDS contract and DC connectivity; not foundry DRC or EM validation",
+        }
+        args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if not count_ok:
+        print(f"FAIL: GDS 수={len(files)}, expected={args.expected_count}; 빈 디렉터리는 통과하지 않습니다.")
+        return 1
     if failed:
         print(f"\nFAIL: {len(failed)}/{len(files)} files")
         for path, errors in failed[:10]:

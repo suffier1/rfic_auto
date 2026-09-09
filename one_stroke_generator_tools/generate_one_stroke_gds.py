@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -24,7 +25,6 @@ from typing import Iterable
 
 # 홈 디렉토리가 읽기 전용인 실행 환경에서도 matplotlib 캐시 경고 없이 동작한다.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-rfic-one-stroke")
-import matplotlib.pyplot as plt
 import numpy as np
 
 # GDS 레이어, 포트, VIA 기록 함수
@@ -59,6 +59,8 @@ SEC_COLOR = "#1768c5"
 PORT_COLOR = "#f4f23b"
 
 Point = tuple[float, float]
+FAMILIES = ("large_rect", "deep_loop", "serpentine")
+MODES = ("aligned", "offset", "independent")
 
 
 @dataclass(frozen=True)
@@ -513,8 +515,11 @@ def mirror_frame(frame: Frame) -> Frame:
     )
 
 
-def make_sample(index: int, seed: int, attempt: int = 0) -> Sample:
-    """index와 seed만으로 항상 같은 샘플을 재현한다."""
+def make_sample(index: int, seed: int, attempt: int = 0, family: str = "all") -> Sample:
+    """seed, 전역 index, family가 같으면 같은 샘플을 재현한다."""
+
+    if family not in ("all", *FAMILIES):
+        raise ValueError(f"알 수 없는 형상 선택: {family}")
 
     rng = np.random.default_rng(np.random.SeedSequence([seed, index, attempt]))
     # 정상 pilot500과 동일하게 5 um 제조 격자를 고정한다.
@@ -522,10 +527,13 @@ def make_sample(index: int, seed: int, attempt: int = 0) -> Sample:
     pri_frame = sample_frame(grid, rng)
 
     # 9개마다 형상 3종 x 상대배치 3종의 모든 조합이 정확히 한 번씩 나온다.
-    families = ("large_rect", "deep_loop", "serpentine")
-    modes = ("aligned", "offset", "independent")
-    family = families[index % len(families)]
-    mode = modes[(index // len(families)) % len(modes)]
+    # all은 기존 v3의 index별 형상과 난수 순서를 그대로 유지한다.
+    # 한 형상만 선택하면 상대배치 3종을 순환하고, 경로의 난수 분포는 유지한다.
+    if family == "all":
+        family = FAMILIES[index % len(FAMILIES)]
+        mode = MODES[(index // len(FAMILIES)) % len(MODES)]
+    else:
+        mode = MODES[index % len(MODES)]
 
     # SEC 경로는 마지막에 좌우 반전된다. 따라서 aligned/offset은 먼저 실제
     # 목표 frame을 정한 다음 역반전하여 생성해야 물리 좌표에서 의도대로 된다.
@@ -631,13 +639,15 @@ def layout_contract_ok(layout: Layout) -> bool:
     )
 
 
-def make_valid_sample(index: int, seed: int, max_attempts: int = 200) -> Sample:
+def make_valid_sample(
+    index: int, seed: int, max_attempts: int = 200, family: str = "all"
+) -> Sample:
     """형상 계열은 유지하며 모든 EM gate를 통과할 때까지 재생성한다."""
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            sample = make_sample(index, seed, attempt=attempt)
+            sample = make_sample(index, seed, attempt=attempt, family=family)
             if layout_contract_ok(sample_layout(sample)):
                 return sample
         except (RuntimeError, ValueError) as error:
@@ -657,6 +667,9 @@ def write_gds(sample: Sample, path: Path) -> None:
 
 def draw_preview(sample: Sample, path: Path) -> None:
     """기존 데이터와 같은 M9/M8 2패널 PNG 미리보기를 저장한다."""
+
+    # PNG를 생략하는 대량 생성에서는 글꼴 검색과 plotting 초기화도 생략한다.
+    import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 6.4), dpi=100)
     fig.suptitle(
@@ -714,6 +727,16 @@ def draw_preview(sample: Sample, path: Path) -> None:
     plt.close(fig)
 
 
+def sweep_count(route: list[Point]) -> int:
+    """수평 진행 방향이 바뀌는 횟수로 serpentine의 횡단 구간 수를 센다."""
+
+    directions = [
+        1 if b[0] > a[0] else -1
+        for a, b in zip(route, route[1:]) if a[0] != b[0]
+    ]
+    return int(bool(directions)) + sum(a != b for a, b in zip(directions, directions[1:]))
+
+
 def manifest_row(sample: Sample) -> dict[str, object]:
     """재현과 분포 확인에 필요한 숫자를 한 행으로 만든다."""
 
@@ -737,6 +760,9 @@ def manifest_row(sample: Sample) -> dict[str, object]:
         "sec_x_right_before_mirror": sample.sec_frame.x_right,
         "sec_y_bottom": sample.sec_frame.y_bottom,
         "sec_y_top": sample.sec_frame.y_top,
+        # 4/6 횡단 구간의 조합별 EM 성능을 나중에 비교하기 위한 기록이다.
+        "pri_sweeps": sweep_count(sample.pri_route) if sample.family == "serpentine" else "",
+        "sec_sweeps": sweep_count(sample.sec_route) if sample.family == "serpentine" else "",
     }
 
 
@@ -747,6 +773,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n", type=int, required=True, help="생성할 전체 데이터 수")
     parser.add_argument("--seed", type=int, required=True, help="전체 생성 난수 seed (0 이상의 정수)")
+    parser.add_argument("--family", choices=("all", *FAMILIES), default="all", help="전체 3종 또는 단일 형상")
+    parser.add_argument("--start-index", type=int, default=0, help="전역 ID 시작값. 분할 생성 시 다음 구간의 시작값")
     parser.add_argument(
         "--outdir",
         type=Path,
@@ -764,6 +792,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--n은 1 이상이어야 합니다.")
     if args.seed < 0:
         parser.error("--seed는 0 이상이어야 합니다.")
+    if args.start_index < 0:
+        parser.error("--start-index는 0 이상이어야 합니다.")
     return args
 
 
@@ -773,9 +803,10 @@ def main() -> None:
     outdir = args.outdir or script_dir / f"one_stroke_gds_seed_{args.seed}"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    planned = [outdir / f"difftx_{i:05d}.gds" for i in range(args.n)]
+    indices = range(args.start_index, args.start_index + args.n)
+    planned = [outdir / f"difftx_{i:05d}.gds" for i in indices]
     if not args.no_png:
-        planned += [outdir / f"difftx_{i:05d}.png" for i in range(args.n)]
+        planned += [outdir / f"difftx_{i:05d}.png" for i in indices]
     planned += [outdir / "manifest.csv", outdir / "dataset_meta.json"]
     collisions = [path for path in planned if path.exists()]
     if collisions and not args.overwrite:
@@ -786,27 +817,18 @@ def main() -> None:
             "다른 --outdir를 쓰거나, 의도한 덮어쓰기라면 --overwrite를 추가하세요."
         )
 
-    rows: list[dict[str, object]] = []
-    for index in range(args.n):
-        sample = make_valid_sample(index, args.seed)
-        write_gds(sample, outdir / f"{sample.tag}.gds")
-        if not args.no_png:
-            draw_preview(sample, outdir / f"{sample.tag}.png")
-        rows.append(manifest_row(sample))
-
-        if (index + 1) % 100 == 0 or index + 1 == args.n:
-            print(f"[{index + 1:>{len(str(args.n))}}/{args.n}] 생성 완료")
-
-    with (outdir / "manifest.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
     metadata = {
         "generator": Path(__file__).name,
         "algorithm": "diverse_one_stroke_em_contract_v3",
         "count": args.n,
         "seed": args.seed,
+        "start_index": args.start_index,
+        "end_index_exclusive": args.start_index + args.n,
+        "family_selection": args.family,
+        "status": "generating",
+        "manifest_schema_version": 2,
+        "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "gds_contract_sha256": hashlib.sha256((script_dir / "em_gds_contract.py").read_bytes()).hexdigest(),
         "size_um": SIZE_UM,
         "dbu_um": DBU_UM,
         "layers": {
@@ -818,13 +840,33 @@ def main() -> None:
         "gds_library": "DIFF_TX.DB",
         "pixel_um": 5.0,
         "port_contract": "all ports on M9; OUT M8-M9 landing with VIA8",
-        "families": ["large_rect", "deep_loop", "serpentine"],
-        "modes": ["aligned", "offset", "independent"],
+        "families": list(FAMILIES) if args.family == "all" else [args.family],
+        "modes": list(MODES),
         "png_generated": not args.no_png,
     }
-    with (outdir / "dataset_meta.json").open("w", encoding="utf-8") as file:
-        json.dump(metadata, file, ensure_ascii=False, indent=2)
-        file.write("\n")
+    meta_path = outdir / "dataset_meta.json"
+    meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    # 전체 샘플을 메모리에 모으지 않고, 기록이 끝난 GDS의 행만 순차 저장한다.
+    # 중단된 batch는 status=generating으로 남으므로 완료 batch와 구분할 수 있다.
+    with (outdir / "manifest.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = None
+        for completed, index in enumerate(indices, 1):
+            sample = make_valid_sample(index, args.seed, family=args.family)
+            write_gds(sample, outdir / f"{sample.tag}.gds")
+            if not args.no_png:
+                draw_preview(sample, outdir / f"{sample.tag}.png")
+            row = manifest_row(sample)
+            if writer is None:
+                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer.writeheader()
+            writer.writerow(row)
+            if completed % 100 == 0 or completed == args.n:
+                file.flush()
+                print(f"[{completed:>{len(str(args.n))}}/{args.n}] 생성 완료", flush=True)
+
+    metadata["status"] = "complete"
+    meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"출력: {outdir.resolve()}")
 

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# 생성물과 EM 결과는 코드 저장소에 포함하지 않는다.
+*.gds
+*.s4p
+*.tar.gz
+*.zip
+one_stroke_generator_tools/one_stroke_gds_*/
+batches/
+em_results/
+analysis_results/
