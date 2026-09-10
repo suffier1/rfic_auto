@@ -80,6 +80,45 @@ def pass_flags(db: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return s21, s21 & (db[..., 0, 0] <= -10) & (db[..., 1, 1] <= -10)
 
 
+def contiguous_band(freq: np.ndarray, margins: np.ndarray, left: int, right: int) -> dict:
+    """타깃을 지지하는 연속 샘플 구간과 문턱 교차점의 선형 dB 추정치를 구한다.
+
+    margins의 모든 열이 0 이상이어야 통과한다. 타깃이 샘플 사이에 있으면
+    양옆 지점 모두의 통과를 요구한다. sweep 끝에 닿으면 실제 대역 끝은 미확정이다.
+    """
+
+    good = (margins >= 0).all(axis=1)
+    result = {"supported": bool(good[left] and good[right]),
+              "low_sample_ghz": None, "high_sample_ghz": None, "sample_span_ghz": None,
+              "low_est_ghz": None, "high_est_ghz": None, "bw_est_ghz": None,
+              "left_censored": None, "right_censored": None}
+    if not result["supported"]:
+        return result
+    lo, hi = left, right
+    while lo > 0 and good[lo - 1]:
+        lo -= 1
+    while hi + 1 < len(freq) and good[hi + 1]:
+        hi += 1
+    low, high = float(freq[lo]), float(freq[hi])
+    if lo > 0:
+        crossings = []
+        for bad, passed in zip(margins[lo - 1], margins[lo]):
+            if bad < 0:
+                crossings.append(freq[lo - 1] + (freq[lo] - freq[lo - 1]) * (-bad) / (passed - bad))
+        low = float(max(crossings))
+    if hi + 1 < len(freq):
+        crossings = []
+        for passed, bad in zip(margins[hi], margins[hi + 1]):
+            if bad < 0:
+                crossings.append(freq[hi] + (freq[hi + 1] - freq[hi]) * passed / (passed - bad))
+        high = float(min(crossings))
+    result.update(low_sample_ghz=float(freq[lo] / 1e9), high_sample_ghz=float(freq[hi] / 1e9),
+                  sample_span_ghz=float((freq[hi] - freq[lo]) / 1e9),
+                  low_est_ghz=low / 1e9, high_est_ghz=high / 1e9, bw_est_ghz=(high - low) / 1e9,
+                  left_censored=lo == 0, right_censored=hi == len(freq) - 1)
+    return result
+
+
 def target_metrics(freq: np.ndarray, s: np.ndarray, target: float) -> dict:
     """직접 EM과 보간을 구분하며, 양옆 지점 통과를 대역 전체 통과로 부르지 않는다."""
 
@@ -97,9 +136,18 @@ def target_metrics(freq: np.ndarray, s: np.ndarray, target: float) -> dict:
         value = (1 - weight) * s[left] + weight * s[right]
         source = "complex_linear_interpolation"
     db = differential_db(value)
+    all_db = differential_db(s)
     p, q = pass_flags(db)
-    bp, bq = pass_flags(differential_db(s[[left, right]]))
-    return {
+    bp, bq = pass_flags(all_db[[left, right]])
+    peak = int(np.argmax(all_db[:, 1, 0]))
+    rl_margins = np.column_stack((-10 - all_db[:, 0, 0], -10 - all_db[:, 1, 1]))
+    joint_margins = np.column_stack((rl_margins, all_db[:, 1, 0] + 3))
+    # 실수 50 Ω 기준의 수동 4-port는 모든 특이값이 1 이하여야 한다.
+    # 차동 S21 통과와 전체 S행렬의 물리적 정상성은 별개로 기록한다.
+    sigma = np.linalg.svd(s, compute_uv=False)[:, 0]
+    target_sigma = float(np.linalg.svd(value, compute_uv=False)[0])
+    brackets_passive = bool((sigma[[left, right]] <= 1 + 1e-6).all())
+    row = {
         "target_ghz": target / 1e9,
         "target_source": source,
         "left_ghz": float(freq[left] / 1e9),
@@ -113,7 +161,20 @@ def target_metrics(freq: np.ndarray, s: np.ndarray, target: float) -> dict:
         "matching_pass_interpolated": bool(q) if not len(exact) else None,
         "s21_pass_both_brackets": bool(bp.all()),
         "matching_pass_both_brackets": bool(bq.all()),
+        "peak_frequency_ghz": float(freq[peak] / 1e9),
+        "peak_at_sweep_edge": peak in (0, len(freq) - 1),
+        "target_below_peak_db": float(all_db[peak, 1, 0] - db[1, 0]),
+        "full_s_sigma_max_target": target_sigma,
+        "full_s_target_passivity_ok": target_sigma <= 1 + 1e-6,
+        "full_s_brackets_passivity_ok": brackets_passive,
+        "full_s_sweep_passivity_ok": bool((sigma <= 1 + 1e-6).all()),
+        "full_s_sweep_sigma_max": float(sigma.max()),
+        "full_s_reciprocity_error_max": float(np.abs(s - s.swapaxes(-1, -2)).max()),
+        "matching_pass_both_brackets_with_local_passivity": bool(bq.all() and brackets_passive),
     }
+    for prefix, margins in (("rl_band", rl_margins), ("joint_band", joint_margins)):
+        row.update({f"{prefix}_{key}": val for key, val in contiguous_band(freq, margins, left, right).items()})
+    return row
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -129,6 +190,10 @@ def summarize(rows: list[dict]) -> dict:
         "matching_pass_interpolated": sum(r["matching_pass_interpolated"] for r in estimated) if estimated else None,
         "s21_pass_both_brackets": sum(r["s21_pass_both_brackets"] for r in rows),
         "matching_pass_both_brackets": sum(r["matching_pass_both_brackets"] for r in rows),
+        "full_s_target_nonpassive_count": sum(not r["full_s_target_passivity_ok"] for r in rows),
+        "full_s_brackets_nonpassive_count": sum(not r["full_s_brackets_passivity_ok"] for r in rows),
+        "full_s_sweep_nonpassive_count": sum(not r["full_s_sweep_passivity_ok"] for r in rows),
+        "matching_pass_both_brackets_with_local_passivity": sum(r["matching_pass_both_brackets_with_local_passivity"] for r in rows),
     }
 
 
@@ -159,7 +224,8 @@ def analyze(manifest_path: Path, sparams: Path, target: float) -> tuple[list[dic
         "target_ghz": target / 1e9,
         "reference": "50 ohm per single-ended port; 100 ohm differential; pairs (1,2),(3,4)",
         "criteria": "Sdd21 >= -3 dB; matching also requires Sdd11 and Sdd22 <= -10 dB at the same frequency",
-        "note": "Brackets are sampled points, not a continuous passband. Interpolation is not direct EM.",
+        "note": "Brackets are sampled points. Target S is complex-linearly interpolated when absent. Band edges use linear dB margins; censored edges give only a sweep-limited width. RL band uses both reflections; joint band also requires Sdd21 >= -3 dB.",
+        "quality_note": "Raw threshold counts and bandwidths do not certify EM validity. Full real-50-ohm S passivity requires sigma_max <= 1 + 1e-6; inspect target, brackets and full sweep separately. No passivity enforcement or data correction is applied. Passing this necessary test does not validate calibration or mesh convergence.",
         "expected_count": len(manifest),
         "missing_indices": sorted(set(manifest) - seen),
         "bracket_pairs_ghz": sorted({(r["left_ghz"], r["right_ghz"]) for r in rows}),

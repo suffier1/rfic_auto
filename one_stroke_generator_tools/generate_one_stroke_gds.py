@@ -61,6 +61,7 @@ PORT_COLOR = "#f4f23b"
 Point = tuple[float, float]
 FAMILIES = ("large_rect", "deep_loop", "serpentine")
 MODES = ("aligned", "offset", "independent")
+SERPENTINE_ENVELOPES = ("bounded", "expanded", "mixed")
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ class Sample:
     sec_frame: Frame
     pri_route: list[Point]
     sec_route: list[Point]
+    serpentine_envelope: str = "bounded"
 
 
 def snap(value: float, grid: float) -> float:
@@ -400,6 +402,43 @@ def build_serpentine(
     return compact_route(points)
 
 
+def build_expanded_serpentine(
+    frame: Frame, grid: float, rng: np.random.Generator
+) -> list[Point]:
+    """포트 높이는 유지하고 본체를 위·아래·양쪽 중 하나로 확장한다.
+
+    포트와 본체의 연결은 본체 왼쪽의 별도 통로를 쓴다. 아래 포트의 통로는
+    아래쪽, 위 포트의 통로는 위쪽에 있어 본체의 왕복 구간과 교차하지 않는다.
+    """
+
+    side = str(rng.choice(("above", "below", "both")))
+    lower = upper = 0.0
+    if side in ("below", "both"):
+        maximum = min(60.0, frame.y_bottom - 15.0)
+        lower = float(rng.choice(np.arange(15.0, maximum + 0.1 * grid, grid)))
+    if side in ("above", "both"):
+        maximum = min(60.0, 280.0 - frame.y_top)
+        upper = float(rng.choice(np.arange(15.0, maximum + 0.1 * grid, grid)))
+    body = Frame(frame.x_left, frame.x_right, frame.y_bottom - lower, frame.y_top + upper)
+    route = build_serpentine(body, grid, rng)
+    corridor_x = frame.x_left - 2 * grid
+    result = join_routes(
+        [(5.0, frame.y_bottom), (corridor_x, frame.y_bottom), (corridor_x, body.y_bottom)],
+        route[1:-1],
+        [(corridor_x, body.y_top), (corridor_x, frame.y_top), (5.0, frame.y_top)],
+    )
+    validate_route(result)
+    # 중심선끼리 교차하지 않더라도 5 um 금속 cell이 닿아 샛길을 만들 수 있다.
+    # 새 확장 방식에는 포트 pad를 붙이기 전 단순 경로 검사도 적용한다.
+    cells = route_cells(result)
+    ends = {tuple(int(round(v / grid)) for v in p) for p in (result[0], result[-1])}
+    for x, y in cells:
+        degree = sum((x + dx, y + dy) in cells for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+        if degree != (1 if (x, y) in ends else 2):
+            raise ValueError("확장 serpentine 금속 경로가 비인접 구간에 접촉합니다.")
+    return result
+
+
 def build_family_route(
     family: str,
     frame: Frame,
@@ -515,11 +554,16 @@ def mirror_frame(frame: Frame) -> Frame:
     )
 
 
-def make_sample(index: int, seed: int, attempt: int = 0, family: str = "all") -> Sample:
+def make_sample(
+    index: int, seed: int, attempt: int = 0, family: str = "all",
+    serpentine_envelope: str = "bounded",
+) -> Sample:
     """seed, 전역 index, family가 같으면 같은 샘플을 재현한다."""
 
     if family not in ("all", *FAMILIES):
         raise ValueError(f"알 수 없는 형상 선택: {family}")
+    if serpentine_envelope not in SERPENTINE_ENVELOPES:
+        raise ValueError(f"알 수 없는 serpentine 범위: {serpentine_envelope}")
 
     rng = np.random.default_rng(np.random.SeedSequence([seed, index, attempt]))
     # 정상 pilot500과 동일하게 5 um 제조 격자를 고정한다.
@@ -544,8 +588,18 @@ def make_sample(index: int, seed: int, attempt: int = 0, family: str = "all") ->
     else:
         sec_frame = sample_frame(grid, rng)
 
-    pri_route = build_family_route(family, pri_frame, grid, rng)
-    sec_left_route = build_family_route(family, sec_frame, grid, rng)
+    envelope = serpentine_envelope
+    if envelope == "mixed":
+        # 방식 선택을 기존 경로 난수와 분리하고 재시도에도 고정한다.
+        # 확장 방식의 재시도가 많더라도 bounded로 바꿔 통과시키지 않는다.
+        envelope_rng = np.random.default_rng(np.random.SeedSequence([seed, index, 20260910]))
+        envelope = str(envelope_rng.choice(("bounded", "expanded")))
+    if family == "serpentine" and envelope == "expanded":
+        pri_route = build_expanded_serpentine(pri_frame, grid, rng)
+        sec_left_route = build_expanded_serpentine(sec_frame, grid, rng)
+    else:
+        pri_route = build_family_route(family, pri_frame, grid, rng)
+        sec_left_route = build_family_route(family, sec_frame, grid, rng)
     sec_route = mirror_for_right_ports(sec_left_route)
     validate_route(pri_route)
     validate_route(sec_route)
@@ -564,6 +618,7 @@ def make_sample(index: int, seed: int, attempt: int = 0, family: str = "all") ->
         sec_frame=sec_frame,
         pri_route=pri_route,
         sec_route=sec_route,
+        serpentine_envelope=envelope if family == "serpentine" else "bounded",
     )
 
 
@@ -640,14 +695,15 @@ def layout_contract_ok(layout: Layout) -> bool:
 
 
 def make_valid_sample(
-    index: int, seed: int, max_attempts: int = 200, family: str = "all"
+    index: int, seed: int, max_attempts: int = 200, family: str = "all",
+    serpentine_envelope: str = "bounded",
 ) -> Sample:
     """형상 계열은 유지하며 모든 EM gate를 통과할 때까지 재생성한다."""
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            sample = make_sample(index, seed, attempt=attempt, family=family)
+            sample = make_sample(index, seed, attempt=attempt, family=family, serpentine_envelope=serpentine_envelope)
             if layout_contract_ok(sample_layout(sample)):
                 return sample
         except (RuntimeError, ValueError) as error:
@@ -763,6 +819,11 @@ def manifest_row(sample: Sample) -> dict[str, object]:
         # 4/6 횡단 구간의 조합별 EM 성능을 나중에 비교하기 위한 기록이다.
         "pri_sweeps": sweep_count(sample.pri_route) if sample.family == "serpentine" else "",
         "sec_sweeps": sweep_count(sample.sec_route) if sample.family == "serpentine" else "",
+        "serpentine_envelope": sample.serpentine_envelope if sample.family == "serpentine" else "",
+        "pri_route_y_min_um": min(y for _, y in sample.pri_route),
+        "pri_route_y_max_um": max(y for _, y in sample.pri_route),
+        "sec_route_y_min_um": min(y for _, y in sample.sec_route),
+        "sec_route_y_max_um": max(y for _, y in sample.sec_route),
     }
 
 
@@ -775,6 +836,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True, help="전체 생성 난수 seed (0 이상의 정수)")
     parser.add_argument("--family", choices=("all", *FAMILIES), default="all", help="전체 3종 또는 단일 형상")
     parser.add_argument("--start-index", type=int, default=0, help="전역 ID 시작값. 분할 생성 시 다음 구간의 시작값")
+    parser.add_argument("--serpentine-envelope", choices=SERPENTINE_ENVELOPES, default="bounded", help="기존 범위 / 포트 높이 밖 확장 / 두 방식 무작위 혼합")
     parser.add_argument(
         "--outdir",
         type=Path,
@@ -819,14 +881,15 @@ def main() -> None:
 
     metadata = {
         "generator": Path(__file__).name,
-        "algorithm": "diverse_one_stroke_em_contract_v3",
+        "algorithm": "diverse_one_stroke_em_contract_v3" if args.serpentine_envelope == "bounded" else "diverse_one_stroke_em_contract_v4",
         "count": args.n,
         "seed": args.seed,
         "start_index": args.start_index,
         "end_index_exclusive": args.start_index + args.n,
         "family_selection": args.family,
         "status": "generating",
-        "manifest_schema_version": 2,
+        "manifest_schema_version": 3,
+        "serpentine_envelope": args.serpentine_envelope,
         "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "gds_contract_sha256": hashlib.sha256((script_dir / "em_gds_contract.py").read_bytes()).hexdigest(),
         "size_um": SIZE_UM,
@@ -852,7 +915,7 @@ def main() -> None:
     with (outdir / "manifest.csv").open("w", newline="", encoding="utf-8") as file:
         writer = None
         for completed, index in enumerate(indices, 1):
-            sample = make_valid_sample(index, args.seed, family=args.family)
+            sample = make_valid_sample(index, args.seed, family=args.family, serpentine_envelope=args.serpentine_envelope)
             write_gds(sample, outdir / f"{sample.tag}.gds")
             if not args.no_png:
                 draw_preview(sample, outdir / f"{sample.tag}.png")

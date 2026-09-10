@@ -12,8 +12,8 @@ from collections import Counter
 
 import numpy as np
 
-from analyze_sparams import MIXED_MODE, analyze, read_touchstone, target_metrics
-from generate_one_stroke_gds import make_valid_sample, manifest_row, sample_layout, validate_route
+from analyze_sparams import MIXED_MODE, analyze, read_touchstone, target_metrics, contiguous_band
+from generate_one_stroke_gds import make_valid_sample, manifest_row, sample_layout, validate_route, route_cells
 from verify_one_stroke_gds import verify_one
 
 
@@ -47,6 +47,30 @@ def touchstone(freq, s, form="ri", unit="hz"):
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_expanded_envelope_keeps_ports_and_simple_paths(self):
+        for index in range(60):
+            sample = make_valid_sample(index, 43, family="serpentine", serpentine_envelope="expanded")
+            for route, frame, side_x in [(sample.pri_route, sample.pri_frame, 5), (sample.sec_route, sample.sec_frame, 295)]:
+                self.assertEqual(route[0], (side_x, frame.y_bottom))
+                self.assertEqual(route[-1], (side_x, frame.y_top))
+                self.assertTrue(min(y for _, y in route) <= frame.y_bottom - 15 or max(y for _, y in route) >= frame.y_top + 15)
+                self.assertGreaterEqual(min(y for _, y in route), 15)
+                self.assertLessEqual(max(y for _, y in route), 285)
+                validate_route(route)
+                cells = route_cells(route)
+                ends = {tuple(round(v / 5) for v in p) for p in (route[0], route[-1])}
+                for x, y in cells:
+                    degree = sum((x + dx, y + dy) in cells for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)])
+                    self.assertEqual(degree, 1 if (x, y) in ends else 2)
+
+    def test_mixed_reproducibility_and_nonserpentine_unchanged(self):
+        whole = [make_valid_sample(i, 43, family="serpentine", serpentine_envelope="mixed") for i in range(18)]
+        self.assertEqual({s.serpentine_envelope for s in whole}, {"bounded", "expanded"})
+        split = [make_valid_sample(i, 43, family="serpentine", serpentine_envelope="mixed") for indices in (range(6), range(6, 18)) for i in indices]
+        self.assertEqual([fingerprint(s) for s in whole], [fingerprint(s) for s in split])
+        for family in ("large_rect", "deep_loop"):
+            self.assertEqual(fingerprint(make_valid_sample(4, 8, family=family)), fingerprint(make_valid_sample(4, 8, family=family, serpentine_envelope="expanded")))
+
     def test_legacy_geometry_fingerprints(self):
         expected = {
             0: "3f42c9224837f7857cb4929dc1cf77c9148ae8d2bc01e5687715840ebb869485",
@@ -131,6 +155,35 @@ class GeneratorTests(unittest.TestCase):
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_common_mode_nonpassivity_is_not_hidden_by_good_dd(self):
+        u = np.array([[1, -1, 0, 0], [0, 0, 1, -1], [1, 1, 0, 0], [0, 0, 1, 1]]) / np.sqrt(2)
+        mixed = np.zeros((2, 4, 4))
+        mixed[:, :2, :2] = [[.1, .8], [.8, .1]]
+        mixed[:, 2:, 2:] = np.eye(2) * 1.5
+        row = target_metrics(np.array([76e9, 78e9]), u.T @ mixed @ u, 77e9)
+        self.assertTrue(row["matching_pass_both_brackets"])
+        self.assertFalse(row["full_s_target_passivity_ok"])
+        self.assertFalse(row["full_s_sweep_passivity_ok"])
+        self.assertFalse(row["matching_pass_both_brackets_with_local_passivity"])
+        self.assertAlmostEqual(row["full_s_sigma_max_target"], 1.5)
+
+    def test_band_uses_intersection_not_union(self):
+        freq = np.arange(5) * 1e9
+        margins = np.array([[-1, -3], [1, -1], [3, 1], [1, 3], [-1, 1]])
+        b = contiguous_band(freq, margins, 2, 2)
+        self.assertEqual(b["low_est_ghz"], 1.5)
+        self.assertEqual(b["high_est_ghz"], 3.5)
+        self.assertEqual(b["bw_est_ghz"], 2)
+        self.assertFalse(b["left_censored"] or b["right_censored"])
+
+    def test_band_does_not_join_disconnected_passbands(self):
+        freq = np.arange(6) * 1e9
+        margins = np.array([[1], [1], [-1], [-1], [1], [1]])
+        b = contiguous_band(freq, margins, 4, 4)
+        self.assertEqual(b["low_est_ghz"], 3.5)
+        self.assertTrue(b["right_censored"])
+        self.assertFalse(contiguous_band(freq, margins, 1, 2)["supported"])
+
     def setUp(self):
         self.freq = np.array([76e9, 78e9])
         dd = np.array([[[.1, .7+.3j], [.7+.3j, .1]], [[.1, .7-.3j], [.7-.3j, .1]]])

@@ -19,6 +19,7 @@ OUTPUT_FOLDER_NAME = "one_stroke_gds_seed_8_new"
 MAKE_PNG = False
 FAMILY = "all"  # all / large_rect / deep_loop / serpentine
 START_INDEX = 0  # 같은 seed로 분할 생성할 때 이전 구간 다음 번호
+SERPENTINE_ENVELOPE = "bounded"  # bounded / expanded / mixed
 # ===========================================================================
 
 
@@ -28,6 +29,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--family", choices=("all", "large_rect", "deep_loop", "serpentine"), default=FAMILY)
     parser.add_argument("--start-index", type=int, default=START_INDEX)
+    parser.add_argument("--serpentine-envelope", choices=("bounded", "expanded", "mixed"), default=SERPENTINE_ENVELOPE)
     parser.add_argument("--outdir", type=Path, default=None, help="지정하면 현재 작업 디렉터리 기준 출력 경로")
     parser.add_argument("--png", action=argparse.BooleanOptionalAction, default=MAKE_PNG)
     args = parser.parse_args()
@@ -55,6 +57,8 @@ def main() -> None:
         args.family,
         "--start-index",
         str(args.start_index),
+        "--serpentine-envelope",
+        args.serpentine_envelope,
         "--outdir",
         str(output_dir),
     ]
