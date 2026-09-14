@@ -9,6 +9,8 @@ EM 시뮬레이션은 실행하지 않는다. 생성한 GDS를 기존 연구실 
 - `generate_one_stroke_gds.py`: one-stroke 형상과 포트 배치를 생성한다.
 - `em_gds_contract.py`: GDS 레이어, 포트, VIA 규격을 정의하고 GDS 파일을 기록한다.
 - `verify_one_stroke_gds.py`: GDS 구조, 포트, VIA, 연결 및 절연 상태를 검사한다.
+- `path_checks.py`: 포트 패드를 포함한 금속 경로의 분기·폐회로·비인접 접촉을 검사한다.
+- `render_gds.py`: 실제 GDS의 금속 셀로 PNG를 만들고 픽셀 일치를 검사한다.
 - `analyze_sparams.py`: manifest와 s4p를 숫자 ID로 연결해 지정 주파수의 차동 성능을 집계한다.
 - `test_one_stroke.py`: 기존 형상 재현·분할 생성·분석 회귀 검사다.
 - `requirements_one_stroke.txt`: 필요한 Python 패키지 목록이다.
@@ -23,6 +25,21 @@ python -m pip install -r requirements_one_stroke.txt
 ```
 
 ## 먼저 30개 생성·검사
+
+현재 200×200 µm 실험용 serpentine 1,000개:
+
+```bash
+python easy_generate_one_stroke.py --n 1000 --seed 43 --size-um 200 --family serpentine --serpentine-envelope freeform --png --outdir ../batches/serpentine_1000_200x200_seed_43
+```
+
+200 µm에서는 40×40개의 5 µm 셀을 사용한다. 300 µm GDS를 축소하지 않는다.
+금속 폭 5 µm, 포트 10×10 µm, via cut 0.36×0.36 µm와 레이어 규격은 유지한다.
+포트는 좌우 끝에 배치하고 피치는 40–120 µm에서 10 µm 단위로 선택한다.
+현재 `--size-um`은 검증한 200/300만 지원하며, 200은 `serpentine + freeform`으로 생성한다.
+`--n`과 `--seed`로 개수와 난수를 바꾼다. 다른 크기/seed/방식의 결과는 별도 디렉터리에 보관한다.
+`--outdir` 생략 시 개수·크기·seed를 포함하는 이름을 자동으로 사용한다.
+
+기존 300 µm 방식의 소규모 생성:
 
 ```bash
 python easy_generate_one_stroke.py --n 30 --seed 42 --family serpentine --outdir ../batches/serpentine_check30
@@ -59,6 +76,14 @@ python easy_generate_one_stroke.py --n 30 --seed 43 --family serpentine --serpen
 - `--serpentine-envelope bounded`: 기존 v3 형상. 기본값이다.
 - `--serpentine-envelope expanded`: 포트 높이는 유지하고 본체를 위·아래·양쪽 중 하나로 확장한다.
 - `--serpentine-envelope mixed`: 샘플마다 bounded/expanded를 각각 50% 확률로 선택한다. 실제 개수는 정확히 절반으로 고정하지 않는다.
+- `--serpentine-envelope freeform`: v5. 위·아래·양쪽 확장, 불균일 행 간격, 행별 좌우 반환점, 작은 상하 굴곡을 무작위로 선택한다. 횡단 구간은 높이가 허용하는 4/6/8개 중에서 고른다.
+
+`freeform`은 각 권선에서 적어도 한 방향으로 포트 높이 밖 본체를 만든다.
+확장량은 20 µm부터 `min(한 변/5, 칩 경계 여유)`까지 5 µm 단위다.
+PRI·SEC의 세 배치 방식은 frame의 상대 배치이며, 실제 굴곡·행 간격·확장 방향까지 일치시키지 않는다.
+포트 패드를 붙인 실제 금속이 단순 경로인지 검사하고 탈락하면 같은 ID에서 재시도한다.
+따라서 통과 형상의 비율은 난수 선택 확률과 정확히 같지 않을 수 있다. 재시도 횟수는 `attempt`에 기록한다.
+이 방식도 행을 차례로 방문하는 serpentine이며, 모든 가능한 자유형 경로의 균일 표본은 아니다.
 
 확장 길이는 선택한 방향으로 15–60 µm 범위의 5 µm 격자에서 뽑으며, 칩 외곽 여유에 따라 상한을 줄인다.
 PRI·SEC는 각각 방향과 길이를 선택한다. 본체 바깥 연결 통로로 원래 포트에 돌아온다.
@@ -71,7 +96,7 @@ python easy_generate_one_stroke.py --n 10000 --seed 43 --family serpentine --ser
 
 다음 batch는 같은 옵션에서 `--start-index 10000`과 새 출력 디렉터리를 지정한다.
 같은 seed·family·index라도 envelope 옵션이 다르면 다른 데이터이므로 별도 batch로 보관한다.
-`dataset_meta.json`은 bounded를 v3, expanded/mixed를 v4로 기록한다.
+`dataset_meta.json`은 bounded를 v3, expanded/mixed를 v4, freeform을 v5로 기록한다.
 확장형의 EM 성능은 아직 검증하지 않았으며, 기존 수율을 그대로 적용하지 않는다.
 
 ## 설정값을 직접 수정하는 경우
@@ -81,20 +106,22 @@ python easy_generate_one_stroke.py --n 10000 --seed 43 --family serpentine --ser
 ```python
 TOTAL_COUNT = 1000
 RANDOM_SEED = 8
-OUTPUT_FOLDER_NAME = "one_stroke_gds_seed_8_new"
+OUTPUT_FOLDER_NAME = None
 MAKE_PNG = False
 FAMILY = "all"
 START_INDEX = 0
 SERPENTINE_ENVELOPE = "bounded"
+SIZE_UM = 300
 ```
 
 - `TOTAL_COUNT`: 생성 개수
 - `RANDOM_SEED`: 난수 seed
-- `OUTPUT_FOLDER_NAME`: 출력 디렉터리 이름
+- `OUTPUT_FOLDER_NAME`: 출력 디렉터리 이름. `None`이면 개수·크기·seed로 자동 생성
 - `MAKE_PNG`: PNG 미리보기 생성 여부
 - `FAMILY`: `all / large_rect / deep_loop / serpentine`
 - `START_INDEX`: 전역 ID 시작값. 같은 seed로 분할 생성할 때 이전 구간 다음 번호
-- `SERPENTINE_ENVELOPE`: `bounded / expanded / mixed`
+- `SERPENTINE_ENVELOPE`: `bounded / expanded / mixed / freeform`
+- `SIZE_UM`: `200 / 300`. 200에서는 `FAMILY="serpentine"`, `SERPENTINE_ENVELOPE="freeform"`으로 설정
 
 명령행 인자를 함께 주면 명령행 값이 우선한다.
 `OUTPUT_FOLDER_NAME`은 코드 디렉터리 기준이고, 명령행의 `--outdir`은 현재 작업 디렉터리 기준이다.
@@ -117,8 +144,35 @@ python easy_generate_one_stroke.py
 
 `dataset_meta.json`의 `status=complete`와 `verification.json`의 `passed=true`를 확인한다.
 이는 생성과 구조 검사의 완료이며 EM 검증 완료를 뜻하지 않는다.
+PNG는 한 패널에 실제 GDS 금속을 표시한다. 빨강=M9, 파랑=M8, 보라=두 층의 투영 겹침이다.
+보라는 단락 판정이 아니며 OUT landing도 보라로 표시된다. 작은 via cut 자체는 PNG에서 생략한다.
+`--png`로 생성하면 PNG 금속 영역 전체와 GDS의 일치 여부도 자동 검사한다.
+
+기존 결과를 다시 검사하려면:
+
+```bash
+python verify_one_stroke_gds.py ../batches/serpentine_1000_200x200_seed_43 --expected-count 1000 --check-png --report ../batches/serpentine_1000_200x200_seed_43/verification.json
+```
+
+크기는 `dataset_meta.json`에서 읽고 v5에는 단순 경로 검사를 자동 적용한다.
 중단된 batch는 `status=generating`으로 남는다. 자동 resume/압축/삭제는 하지 않으며,
 중단된 batch를 EM에 넣지 말고 새 출력 디렉터리에서 같은 설정으로 다시 생성한다.
+
+## 압축과 Git 제외
+
+생성 데이터는 `gen_data_colab/batches/`에 보관한다. `.gitignore`가 `batches/` 전체와
+`*.tar.gz`를 제외하므로 GDS·PNG·manifest·압축파일은 Git에 추가되지 않는다.
+`git add -f`로 강제 추가하지 않는다. 코드와 사용법만 commit/push한다.
+
+디렉터리 확인 후 직접 압축한다. `one_stroke_generator_tools`에서 실행:
+
+```bash
+cd ../batches
+tar -czf serpentine_1000_200x200_seed_43.tar.gz serpentine_1000_200x200_seed_43
+```
+
+원본 디렉터리는 그대로 유지된다. 같은 이름의 압축파일이 있으면 덮어쓰므로
+기존 파일을 보존하려면 출력 파일명을 바꾼다. 생성 코드에서 자동 압축하지 않는다.
 
 ## EM 결과 분석
 
@@ -155,7 +209,7 @@ Touchstone 1의 4-port, 포트별 50 Ω 기준을 지원한다. 포트 1·2가 P
 수정한다. 레이어, 포트 또는 VIA 규격을 변경할 때만 `em_gds_contract.py`를
 수정한다.
 
-`bounded`의 기본 경로 분포는 v3 그대로다. `serpentine`은 권선마다 4/6 횡단 구간을 독립적으로 선택하고,
+`bounded`의 기본 경로 분포는 v3 그대로다. 기존 `serpentine`은 권선마다 4/6 횡단 구간을 독립적으로 선택하고,
 세 배치 방식을 고르게 생성한다. 성능에 따른 거절 선별은 생성기에 넣지 않았다.
 `--family all --start-index 0`은 기존 seed/index의 형상을 재현한다.
 기본 GDS 검사는 foundry DRC signoff나 EM 정확성 검사가 아니다.

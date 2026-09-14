@@ -15,11 +15,12 @@ import sys
 # ===========================================================================
 TOTAL_COUNT = 1000
 RANDOM_SEED = 8
-OUTPUT_FOLDER_NAME = "one_stroke_gds_seed_8_new"
+OUTPUT_FOLDER_NAME = None  # None이면 개수·크기·seed로 디렉터리 이름 자동 생성
 MAKE_PNG = False
 FAMILY = "all"  # all / large_rect / deep_loop / serpentine
 START_INDEX = 0  # 같은 seed로 분할 생성할 때 이전 구간 다음 번호
-SERPENTINE_ENVELOPE = "bounded"  # bounded / expanded / mixed
+SERPENTINE_ENVELOPE = "bounded"  # bounded / expanded / mixed / freeform
+SIZE_UM = 300  # 200 / 300; 200은 serpentine + freeform으로 생성
 # ===========================================================================
 
 
@@ -29,14 +30,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--family", choices=("all", "large_rect", "deep_loop", "serpentine"), default=FAMILY)
     parser.add_argument("--start-index", type=int, default=START_INDEX)
-    parser.add_argument("--serpentine-envelope", choices=("bounded", "expanded", "mixed"), default=SERPENTINE_ENVELOPE)
+    parser.add_argument("--serpentine-envelope", choices=("bounded", "expanded", "mixed", "freeform"), default=SERPENTINE_ENVELOPE)
+    parser.add_argument("--size-um", type=int, choices=(200, 300), default=SIZE_UM)
     parser.add_argument("--outdir", type=Path, default=None, help="지정하면 현재 작업 디렉터리 기준 출력 경로")
     parser.add_argument("--png", action=argparse.BooleanOptionalAction, default=MAKE_PNG)
     args = parser.parse_args()
     script_dir = Path(__file__).resolve().parent
     generator = script_dir / "generate_one_stroke_gds.py"
     verifier = script_dir / "verify_one_stroke_gds.py"
-    output_dir = (args.outdir or script_dir / OUTPUT_FOLDER_NAME).resolve()
+    output_dir = (args.outdir or script_dir / (OUTPUT_FOLDER_NAME or f"one_stroke_{args.n}_{args.size_um}x{args.size_um}_seed_{args.seed}")).resolve()
     if args.n <= 0 or args.seed < 0 or args.start_index < 0:
         parser.error("n은 1 이상, seed와 start-index는 0 이상이어야 합니다.")
     if output_dir.exists():
@@ -59,6 +61,8 @@ def main() -> None:
         str(args.start_index),
         "--serpentine-envelope",
         args.serpentine_envelope,
+        "--size-um",
+        str(args.size_um),
         "--outdir",
         str(output_dir),
     ]
@@ -78,7 +82,7 @@ def main() -> None:
             str(args.n),
             "--report",
             str(output_dir / "verification.json"),
-        ],
+        ] + (["--check-png"] if args.png else []),
         check=True,
     )
 

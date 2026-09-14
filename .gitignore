@@ -8,6 +8,7 @@ __pycache__/
 *.tar.gz
 *.zip
 one_stroke_generator_tools/one_stroke_gds_*/
+one_stroke_generator_tools/one_stroke_*_seed_*/
 batches/
 em_results/
 analysis_results/

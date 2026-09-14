@@ -61,7 +61,7 @@ PORT_COLOR = "#f4f23b"
 Point = tuple[float, float]
 FAMILIES = ("large_rect", "deep_loop", "serpentine")
 MODES = ("aligned", "offset", "independent")
-SERPENTINE_ENVELOPES = ("bounded", "expanded", "mixed")
+SERPENTINE_ENVELOPES = ("bounded", "expanded", "mixed", "freeform")
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,7 @@ class Sample:
     pri_route: list[Point]
     sec_route: list[Point]
     serpentine_envelope: str = "bounded"
+    size_um: float = SIZE_UM
 
 
 def snap(value: float, grid: float) -> float:
@@ -439,6 +440,47 @@ def build_expanded_serpentine(
     return result
 
 
+def build_freeform_serpentine(frame: Frame, grid: float, rng: np.random.Generator,
+                              size_um: float) -> list[Point]:
+    """포트 밖 확장, 불균일 행 간격, 좌우 반환 위치, 작은 굴곡을 무작위로 고른다.
+
+    아래 포트 → 바깥 통로 → 지그재그 본체 → 바깥 통로 → 위 포트 순서다.
+    행을 순서대로 방문하되 행마다 길이와 간격을 바꾼다. 최종 금속 셀 검사는
+    포트 패드까지 붙인 뒤 별도로 수행하여 교차·분기·샛길을 제외한다.
+    """
+    side = str(rng.choice(("above", "below", "both")))
+    lower = upper = 0.0
+    if side in ("below", "both"):
+        lower = float(rng.choice(np.arange(20, min(size_um / 5, frame.y_bottom - 15) + .1, grid)))
+    if side in ("above", "both"):
+        upper = float(rng.choice(np.arange(20, min(size_um / 5, size_um - 20 - frame.y_top) + .1, grid)))
+    y0, y1 = frame.y_bottom - lower, frame.y_top + upper
+    # 왕복 횟수는 가능한 4/6/8개 중에서 선택한다. 최소 행 간격은 20 um이다.
+    possible = [n for n in (4, 6, 8) if (n - 1) * 4 * grid <= y1 - y0]
+    if not possible:
+        raise ValueError("serpentine 행을 배치할 높이가 부족합니다.")
+    count = int(rng.choice(possible))
+    slack = int(round((y1 - y0) / grid)) - 4 * (count - 1)
+    gaps = 4 + rng.multinomial(slack, rng.dirichlet(np.ones(count - 1)))
+    levels = [y0, *(y0 + grid * np.cumsum(gaps)).tolist()]
+    corridor = frame.x_left - 2 * grid
+    points = [(5.0, frame.y_bottom), (corridor, frame.y_bottom), (corridor, y0), (frame.x_left, y0)]
+    # 반환점은 매 행 새로 뽑는다. 포트 연결 통로와 본체 사이에는 빈 셀을 남긴다.
+    reach_jitter = min(4, int((frame.x_right - frame.x_left) / grid / 4))
+    for i, y in enumerate(levels):
+        start_x = points[-1][0]
+        end_x = (frame.x_right - int(rng.integers(reach_jitter + 1)) * grid
+                 if i % 2 == 0 else frame.x_left + int(rng.integers(reach_jitter + 1)) * grid)
+        sweep = jagged_horizontal((start_x, y), (end_x, y), int(rng.choice((-1, 1))),
+                                  grid, rng, max_offset_steps=int(rng.integers(0, 2)))
+        points = join_routes(points, sweep)
+        if i + 1 < count:
+            append_point(points, (end_x, levels[i + 1]))
+    points = join_routes(points, [(corridor, y1), (corridor, frame.y_top), (5.0, frame.y_top)])
+    validate_route(points, size_um)
+    return points
+
+
 def build_family_route(
     family: str,
     frame: Frame,
@@ -456,10 +498,10 @@ def build_family_route(
     raise ValueError(f"알 수 없는 형상 계열: {family}")
 
 
-def mirror_for_right_ports(route: list[Point]) -> list[Point]:
+def mirror_for_right_ports(route: list[Point], size_um: float = SIZE_UM) -> list[Point]:
     """왼쪽 포트용 루프를 x축 방향으로 뒤집어 오른쪽 포트용으로 만든다."""
 
-    return [(SIZE_UM - x, y) for x, y in route]
+    return [(size_um - x, y) for x, y in route]
 
 
 def segment_intersects(a: Point, b: Point, c: Point, d: Point) -> bool:
@@ -486,14 +528,14 @@ def segment_intersects(a: Point, b: Point, c: Point, d: Point) -> bool:
     return min(cx, dx) <= ax <= max(cx, dx) and min(ay, by) <= cy <= max(ay, by)
 
 
-def validate_route(route: list[Point]) -> None:
+def validate_route(route: list[Point], size_um: float = SIZE_UM) -> None:
     """직교성, 칩 경계, 자기 교차 여부를 검사한다."""
 
     if len(route) < 4:
         raise ValueError("경로가 너무 짧습니다.")
 
     for x, y in route:
-        if not (0.0 <= x <= SIZE_UM and 0.0 <= y <= SIZE_UM):
+        if not (0.0 <= x < size_um and 0.0 <= y < size_um):
             raise ValueError(f"칩 경계를 벗어난 점: {(x, y)}")
 
     segments = list(zip(route, route[1:]))
@@ -515,11 +557,15 @@ def route_length(route: list[Point]) -> float:
     return sum(abs(x1 - x0) + abs(y1 - y0) for (x0, y0), (x1, y1) in zip(route, route[1:]))
 
 
-def sample_frame(grid: float, rng: np.random.Generator) -> Frame:
+def sample_frame(grid: float, rng: np.random.Generator, size_um: float = SIZE_UM) -> Frame:
     """300 um 영역 대부분을 쓰고 포트 중심은 y=150에 대칭인 frame."""
 
     # 정상 batch의 포트 pitch 60--180 um와 정확히 동일한 범위:
     # y_bottom = 150 - pitch / 2 -> 60--120 um.
+    if size_um != 300:
+        y_bottom = float(rng.choice(np.arange(40, 81, grid)))
+        return Frame(float(rng.choice(np.arange(30, 46, grid))),
+                     float(rng.choice(np.arange(155, 171, grid))), y_bottom, size_um - y_bottom)
     y_bottom = snap(float(rng.uniform(60.0, 121.0)), grid)
     return Frame(
         x_left=snap(float(rng.uniform(25.0, 61.0)), grid),
@@ -529,11 +575,15 @@ def sample_frame(grid: float, rng: np.random.Generator) -> Frame:
     )
 
 
-def shifted_frame(frame: Frame, grid: float, rng: np.random.Generator) -> Frame:
+def shifted_frame(frame: Frame, grid: float, rng: np.random.Generator, size_um: float = SIZE_UM) -> Frame:
     """기준 루프를 1~2격자 이동해 부분 정렬된 두 번째 루프를 만든다."""
 
     dx = int(rng.choice([-2, -1, 1, 2])) * grid
     dy = int(rng.choice([-2, -1, 1, 2])) * grid
+    if size_um != 300:
+        y_bottom = snap(min(80, max(40, frame.y_bottom + dy)), grid)
+        return Frame(min(50, max(25, frame.x_left + dx)),
+                     min(175, max(150, frame.x_right + dx)), y_bottom, size_um - y_bottom)
     y_bottom = snap(min(120.0, max(60.0, frame.y_bottom + dy)), grid)
     return Frame(
         x_left=snap(min(70.0, max(20.0, frame.x_left + dx)), grid),
@@ -543,12 +593,12 @@ def shifted_frame(frame: Frame, grid: float, rng: np.random.Generator) -> Frame:
     )
 
 
-def mirror_frame(frame: Frame) -> Frame:
+def mirror_frame(frame: Frame, size_um: float = SIZE_UM) -> Frame:
     """실제 좌우 반전 뒤 원하는 위치가 되도록 frame 좌표를 변환한다."""
 
     return Frame(
-        x_left=SIZE_UM - frame.x_right,
-        x_right=SIZE_UM - frame.x_left,
+        x_left=size_um - frame.x_right,
+        x_right=size_um - frame.x_left,
         y_bottom=frame.y_bottom,
         y_top=frame.y_top,
     )
@@ -557,6 +607,7 @@ def mirror_frame(frame: Frame) -> Frame:
 def make_sample(
     index: int, seed: int, attempt: int = 0, family: str = "all",
     serpentine_envelope: str = "bounded",
+    size_um: float = SIZE_UM,
 ) -> Sample:
     """seed, 전역 index, family가 같으면 같은 샘플을 재현한다."""
 
@@ -564,11 +615,15 @@ def make_sample(
         raise ValueError(f"알 수 없는 형상 선택: {family}")
     if serpentine_envelope not in SERPENTINE_ENVELOPES:
         raise ValueError(f"알 수 없는 serpentine 범위: {serpentine_envelope}")
+    if size_um not in (200, 300):
+        raise ValueError("현재 지원하는 크기는 200 또는 300 um입니다.")
+    if size_um != 300 and (family != "serpentine" or serpentine_envelope != "freeform"):
+        raise ValueError("200 um 생성에는 --family serpentine --serpentine-envelope freeform을 사용하세요.")
 
     rng = np.random.default_rng(np.random.SeedSequence([seed, index, attempt]))
     # 정상 pilot500과 동일하게 5 um 제조 격자를 고정한다.
     grid = 5.0
-    pri_frame = sample_frame(grid, rng)
+    pri_frame = sample_frame(grid, rng, size_um)
 
     # 9개마다 형상 3종 x 상대배치 3종의 모든 조합이 정확히 한 번씩 나온다.
     # all은 기존 v3의 index별 형상과 난수 순서를 그대로 유지한다.
@@ -582,11 +637,11 @@ def make_sample(
     # SEC 경로는 마지막에 좌우 반전된다. 따라서 aligned/offset은 먼저 실제
     # 목표 frame을 정한 다음 역반전하여 생성해야 물리 좌표에서 의도대로 된다.
     if mode == "aligned":
-        sec_frame = mirror_frame(pri_frame)
+        sec_frame = mirror_frame(pri_frame, size_um)
     elif mode == "offset":
-        sec_frame = mirror_frame(shifted_frame(pri_frame, grid, rng))
+        sec_frame = mirror_frame(shifted_frame(pri_frame, grid, rng, size_um), size_um)
     else:
-        sec_frame = sample_frame(grid, rng)
+        sec_frame = sample_frame(grid, rng, size_um)
 
     envelope = serpentine_envelope
     if envelope == "mixed":
@@ -594,15 +649,18 @@ def make_sample(
         # 확장 방식의 재시도가 많더라도 bounded로 바꿔 통과시키지 않는다.
         envelope_rng = np.random.default_rng(np.random.SeedSequence([seed, index, 20260910]))
         envelope = str(envelope_rng.choice(("bounded", "expanded")))
-    if family == "serpentine" and envelope == "expanded":
+    if family == "serpentine" and envelope == "freeform":
+        pri_route = build_freeform_serpentine(pri_frame, grid, rng, size_um)
+        sec_left_route = build_freeform_serpentine(sec_frame, grid, rng, size_um)
+    elif family == "serpentine" and envelope == "expanded":
         pri_route = build_expanded_serpentine(pri_frame, grid, rng)
         sec_left_route = build_expanded_serpentine(sec_frame, grid, rng)
     else:
         pri_route = build_family_route(family, pri_frame, grid, rng)
         sec_left_route = build_family_route(family, sec_frame, grid, rng)
-    sec_route = mirror_for_right_ports(sec_left_route)
-    validate_route(pri_route)
-    validate_route(sec_route)
+    sec_route = mirror_for_right_ports(sec_left_route, size_um)
+    validate_route(pri_route, size_um)
+    validate_route(sec_route, size_um)
 
     return Sample(
         tag=f"difftx_{index:05d}",
@@ -619,10 +677,11 @@ def make_sample(
         pri_route=pri_route,
         sec_route=sec_route,
         serpentine_envelope=envelope if family == "serpentine" else "bounded",
+        size_um=size_um,
     )
 
 
-def route_cells(route: list[Point]) -> set[tuple[int, int]]:
+def route_cells(route: list[Point], size_um: float = SIZE_UM) -> set[tuple[int, int]]:
     """5 um 중심선 경로를 연속된 1-cell 금속 경로로 변환한다."""
 
     points = [(int(round(x / 5.0)), int(round(y / 5.0))) for x, y in route]
@@ -634,19 +693,21 @@ def route_cells(route: list[Point]) -> set[tuple[int, int]]:
             cells.update((x0, y) for y in range(min(y0, y1), max(y0, y1) + 1))
         else:
             raise ValueError("직교하지 않은 route는 cell로 변환할 수 없습니다.")
-    if not cells or any(not (0 <= x < 60 and 0 <= y < 60) for x, y in cells):
-        raise ValueError("route cell이 60x60 canvas를 벗어났습니다.")
+    n = int(size_um / 5)
+    if not cells or any(not (0 <= x < n and 0 <= y < n) for x, y in cells):
+        raise ValueError(f"route cell이 {n}x{n} canvas를 벗어났습니다.")
     return cells
 
 
-def two_by_two_pin(side: str, y_center_um: float) -> list[tuple[int, int]]:
+def two_by_two_pin(side: str, y_center_um: float, size_um: float = SIZE_UM) -> list[tuple[int, int]]:
     """정상 pilot와 동일한 10x10 um 포트 pin cell 4개를 만든다."""
 
     center_row = int(round(y_center_um / 5.0))
     rows = (center_row - 1, center_row)
-    cols = (0, 1) if side == "left" else (58, 59)
+    n = int(size_um / 5)
+    cols = (0, 1) if side == "left" else (n - 2, n - 1)
     cells = [(x, y) for x in cols for y in rows]
-    if any(not (0 <= x < 60 and 0 <= y < 60) for x, y in cells):
+    if any(not (0 <= x < n and 0 <= y < n) for x, y in cells):
         raise ValueError("port pin이 canvas를 벗어났습니다.")
     return cells
 
@@ -660,15 +721,15 @@ def sample_layout(sample: Sample) -> Layout:
     """
 
     ports = {
-        "IN_P": two_by_two_pin("left", sample.pri_route[0][1]),
-        "IN_N": two_by_two_pin("left", sample.pri_route[-1][1]),
-        "OUT_P": two_by_two_pin("right", sample.sec_route[0][1]),
-        "OUT_N": two_by_two_pin("right", sample.sec_route[-1][1]),
+        "IN_P": two_by_two_pin("left", sample.pri_route[0][1], sample.size_um),
+        "IN_N": two_by_two_pin("left", sample.pri_route[-1][1], sample.size_um),
+        "OUT_P": two_by_two_pin("right", sample.sec_route[0][1], sample.size_um),
+        "OUT_N": two_by_two_pin("right", sample.sec_route[-1][1], sample.size_um),
     }
     in_pins = set(ports["IN_P"]) | set(ports["IN_N"])
     out_pins = set(ports["OUT_P"]) | set(ports["OUT_N"])
-    pri = route_cells(sample.pri_route) | in_pins
-    sec = route_cells(sample.sec_route) | out_pins
+    pri = route_cells(sample.pri_route, sample.size_um) | in_pins
+    sec = route_cells(sample.sec_route, sample.size_um) | out_pins
 
     layout = Layout(
         cells={
@@ -678,7 +739,7 @@ def sample_layout(sample: Sample) -> Layout:
         vias=set(out_pins),
         ports=ports,
         floating={M9: set(), M8: set()},
-        meta={"family": sample.family, "mode": sample.mode},
+        meta={"family": sample.family, "mode": sample.mode, "size_um": sample.size_um},
     )
     return layout
 
@@ -697,14 +758,21 @@ def layout_contract_ok(layout: Layout) -> bool:
 def make_valid_sample(
     index: int, seed: int, max_attempts: int = 200, family: str = "all",
     serpentine_envelope: str = "bounded",
+    size_um: float = SIZE_UM,
 ) -> Sample:
     """형상 계열은 유지하며 모든 EM gate를 통과할 때까지 재생성한다."""
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            sample = make_sample(index, seed, attempt=attempt, family=family, serpentine_envelope=serpentine_envelope)
-            if layout_contract_ok(sample_layout(sample)):
+            sample = make_sample(index, seed, attempt=attempt, family=family, serpentine_envelope=serpentine_envelope, size_um=size_um)
+            layout = sample_layout(sample)
+            if sample.serpentine_envelope == "freeform":
+                from path_checks import simple_path_ok
+                if not all(simple_path_ok(layout.cells[net][layer], layout.ports[a], layout.ports[b])
+                           for net, layer, a, b in ((NET_IN, M9, "IN_P", "IN_N"), (NET_OUT, M8, "OUT_P", "OUT_N"))):
+                    raise ValueError("패드를 포함한 금속에 분기·폐회로·비인접 접촉이 있습니다.")
+            if layout_contract_ok(layout):
                 return sample
         except (RuntimeError, ValueError) as error:
             last_error = error
@@ -722,65 +790,10 @@ def write_gds(sample: Sample, path: Path) -> None:
 
 
 def draw_preview(sample: Sample, path: Path) -> None:
-    """기존 데이터와 같은 M9/M8 2패널 PNG 미리보기를 저장한다."""
-
-    # PNG를 생략하는 대량 생성에서는 글꼴 검색과 plotting 초기화도 생략한다.
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 6.4), dpi=100)
-    fig.suptitle(
-        f"{sample.tag} | {sample.family} | {sample.mode}",
-        fontsize=14,
-        y=0.98,
-    )
-
-    for ax, title in zip(axes, ["M9 (PRI / IN)", "M8 (SEC / OUT)"]):
-        ax.set_title(title, fontsize=13)
-        ax.set_xlim(0, SIZE_UM)
-        ax.set_ylim(0, SIZE_UM)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xticks(np.arange(0, SIZE_UM + 1, 50))
-        ax.set_yticks(np.arange(0, SIZE_UM + 1, 50))
-
-    axes[0].plot(
-        *zip(*sample.pri_route),
-        color=PRI_COLOR,
-        linewidth=sample.pri_width_um * 1.35,
-        solid_capstyle="projecting",
-        solid_joinstyle="miter",
-    )
-    axes[1].plot(
-        *zip(*sample.sec_route),
-        color=SEC_COLOR,
-        linewidth=sample.sec_width_um * 1.35,
-        solid_capstyle="projecting",
-        solid_joinstyle="miter",
-    )
-
-    ports = [
-        ("IN_P", sample.pri_route[0], "left"),
-        ("IN_N", sample.pri_route[-1], "left"),
-        ("OUT_P", sample.sec_route[0], "right"),
-        ("OUT_N", sample.sec_route[-1], "right"),
-    ]
-    for ax in axes:
-        for name, (_, y), side in ports:
-            x = 2 if side == "left" else 298
-            ax.text(
-                x,
-                y,
-                name,
-                ha="left" if side == "left" else "right",
-                va="center",
-                fontsize=9,
-                fontweight="bold",
-                bbox={"facecolor": PORT_COLOR, "edgecolor": "black", "pad": 0.7},
-                zorder=20,
-            )
-
-    fig.subplots_adjust(left=0.055, right=0.99, bottom=0.06, top=0.91, wspace=0.12)
-    fig.savefig(path, dpi=100)
-    plt.close(fig)
+    """같은 이름의 GDS에서 실제 금속 영역을 읽어 PNG로 저장한다."""
+    from render_gds import render_gds
+    render_gds(path.with_suffix(".gds"), path, sample.size_um,
+               f"{sample.family} | {sample.mode} | {sample.serpentine_envelope}")
 
 
 def sweep_count(route: list[Point]) -> int:
@@ -804,6 +817,8 @@ def manifest_row(sample: Sample) -> dict[str, object]:
         "family": sample.family,
         "mode": sample.mode,
         "grid_um": sample.grid_um,
+        "size_um": sample.size_um,
+        "grid_n": int(sample.size_um / sample.grid_um),
         "pri_width_um": sample.pri_width_um,
         "sec_width_um": sample.sec_width_um,
         "pri_length_um": route_length(sample.pri_route),
@@ -836,6 +851,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True, help="전체 생성 난수 seed (0 이상의 정수)")
     parser.add_argument("--family", choices=("all", *FAMILIES), default="all", help="전체 3종 또는 단일 형상")
     parser.add_argument("--start-index", type=int, default=0, help="전역 ID 시작값. 분할 생성 시 다음 구간의 시작값")
+    parser.add_argument("--size-um", type=int, choices=(200, 300), default=300, help="정사각형 영역의 한 변 [um]; 5 um 격자와 금속/via 크기는 고정")
     parser.add_argument("--serpentine-envelope", choices=SERPENTINE_ENVELOPES, default="bounded", help="기존 범위 / 포트 높이 밖 확장 / 두 방식 무작위 혼합")
     parser.add_argument(
         "--outdir",
@@ -856,13 +872,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--seed는 0 이상이어야 합니다.")
     if args.start_index < 0:
         parser.error("--start-index는 0 이상이어야 합니다.")
+    if args.size_um == 200 and (args.family != "serpentine" or args.serpentine_envelope != "freeform"):
+        parser.error("200 um에는 --family serpentine --serpentine-envelope freeform이 필요합니다.")
     return args
 
 
 def main() -> None:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
-    outdir = args.outdir or script_dir / f"one_stroke_gds_seed_{args.seed}"
+    outdir = args.outdir or script_dir / f"one_stroke_{args.n}_{args.size_um}x{args.size_um}_seed_{args.seed}"
     outdir.mkdir(parents=True, exist_ok=True)
 
     indices = range(args.start_index, args.start_index + args.n)
@@ -881,18 +899,22 @@ def main() -> None:
 
     metadata = {
         "generator": Path(__file__).name,
-        "algorithm": "diverse_one_stroke_em_contract_v3" if args.serpentine_envelope == "bounded" else "diverse_one_stroke_em_contract_v4",
+        "algorithm": ("diverse_one_stroke_em_contract_v5" if args.serpentine_envelope == "freeform" else
+                      "diverse_one_stroke_em_contract_v3" if args.serpentine_envelope == "bounded" else "diverse_one_stroke_em_contract_v4"),
         "count": args.n,
         "seed": args.seed,
         "start_index": args.start_index,
         "end_index_exclusive": args.start_index + args.n,
         "family_selection": args.family,
         "status": "generating",
-        "manifest_schema_version": 3,
+        "manifest_schema_version": 4,
         "serpentine_envelope": args.serpentine_envelope,
         "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "gds_contract_sha256": hashlib.sha256((script_dir / "em_gds_contract.py").read_bytes()).hexdigest(),
-        "size_um": SIZE_UM,
+        "path_checks_sha256": hashlib.sha256((script_dir / "path_checks.py").read_bytes()).hexdigest(),
+        "renderer_sha256": hashlib.sha256((script_dir / "render_gds.py").read_bytes()).hexdigest(),
+        "size_um": args.size_um,
+        "grid_n": args.size_um // 5,
         "dbu_um": DBU_UM,
         "layers": {
             "M9_PRI": f"{M9_LAYER}/{M9_DATATYPE}",
@@ -906,6 +928,7 @@ def main() -> None:
         "families": list(FAMILIES) if args.family == "all" else [args.family],
         "modes": list(MODES),
         "png_generated": not args.no_png,
+        "preview": "actual GDS metal mask; one-panel M9/M8 overlay; via cuts omitted",
     }
     meta_path = outdir / "dataset_meta.json"
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -915,7 +938,7 @@ def main() -> None:
     with (outdir / "manifest.csv").open("w", newline="", encoding="utf-8") as file:
         writer = None
         for completed, index in enumerate(indices, 1):
-            sample = make_valid_sample(index, args.seed, family=args.family, serpentine_envelope=args.serpentine_envelope)
+            sample = make_valid_sample(index, args.seed, family=args.family, serpentine_envelope=args.serpentine_envelope, size_um=args.size_um)
             write_gds(sample, outdir / f"{sample.tag}.gds")
             if not args.no_png:
                 draw_preview(sample, outdir / f"{sample.tag}.png")

@@ -47,6 +47,57 @@ def touchstone(freq, s, form="ri", unit="hz"):
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_freeform_size_reproducibility_and_diversity(self):
+        from path_checks import simple_path_ok
+        for size in (200, 300):
+            samples = [make_valid_sample(i, 43, family="serpentine", serpentine_envelope="freeform", size_um=size) for i in range(60)]
+            self.assertEqual(len({fingerprint(s) for s in samples}), 60)
+            self.assertEqual(Counter(s.mode for s in samples), {"aligned": 20, "offset": 20, "independent": 20})
+            self.assertEqual({manifest_row(s)["pri_sweeps"] for s in samples}, {4, 6, 8})
+            for s in samples:
+                layout = sample_layout(s)
+                for route, frame in ((s.pri_route, s.pri_frame), (s.sec_route, s.sec_frame)):
+                    self.assertTrue(min(y for _, y in route) <= frame.y_bottom - 20 or max(y for _, y in route) >= frame.y_top + 20)
+                for net, layer, side in ((1, 0, "IN"), (2, 1, "OUT")):
+                    self.assertTrue(simple_path_ok(layout.cells[net][layer], layout.ports[side + "_P"], layout.ports[side + "_N"]))
+                self.assertTrue(all(0 <= x < size / 5 and 0 <= y < size / 5 for layer in (0, 1) for x, y in layout.all_metal(layer)))
+            for i in (0, 19, 59):
+                self.assertEqual(fingerprint(samples[i]), fingerprint(make_valid_sample(i, 43, family="serpentine", serpentine_envelope="freeform", size_um=size)))
+            self.assertNotEqual(fingerprint(samples[0]), fingerprint(make_valid_sample(0, 44, family="serpentine", serpentine_envelope="freeform", size_um=size)))
+
+    def test_freeform_cli_png_and_defect_detection(self):
+        import gdstk
+        from PIL import Image
+        from render_gds import preview_matches, LEFT, TOP
+        with tempfile.TemporaryDirectory(prefix="rfic-200-test-") as tmp:
+            out = Path(tmp) / "batch"
+            run = subprocess.run([sys.executable, str(ROOT / "easy_generate_one_stroke.py"),
+                                  "--n", "9", "--seed", "43", "--family", "serpentine", "--size-um", "200",
+                                  "--serpentine-envelope", "freeform", "--png", "--outdir", str(out)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertTrue(json.loads((out / "verification.json").read_text())["png_checked"])
+            p = out / "difftx_00000.gds"
+            self.assertEqual(verify_one(p, 200, True), [])
+            self.assertTrue(verify_one(p, 300, True))
+            self.assertTrue(preview_matches(p, p.with_suffix(".png"), 200))
+            with Image.open(p.with_suffix(".png")) as image:
+                image.putpixel((LEFT, TOP), (0, 0, 0))
+                image.save(p.with_suffix(".png"))
+            self.assertFalse(preview_matches(p, p.with_suffix(".png"), 200))
+            lib = gdstk.read_gds(p)
+            cut = next(poly for poly in lib.top_level()[0].polygons if poly.layer == 58)
+            cut.translate(.01, 0)
+            lib.write_gds(p)
+            self.assertTrue(any("VIA cut" in error for error in verify_one(p, 200, True)))
+
+    def test_simple_path_rejects_branch_cycle_and_diagonal(self):
+        from path_checks import simple_path_ok
+        cells = {(x, 0) for x in range(6)}
+        self.assertTrue(simple_path_ok(cells, {(0, 0)}, {(5, 0)}))
+        self.assertFalse(simple_path_ok(cells | {(2, 1)}, {(0, 0)}, {(5, 0)}))
+        self.assertFalse(simple_path_ok(cells | {(x, 2) for x in range(2, 5)} | {(2, 1), (4, 1)}, {(0, 0)}, {(5, 0)}))
+        self.assertFalse(simple_path_ok(cells | {(6, 1)}, {(0, 0)}, {(6, 1)}))
+
     def test_expanded_envelope_keeps_ports_and_simple_paths(self):
         for index in range(60):
             sample = make_valid_sample(index, 43, family="serpentine", serpentine_envelope="expanded")
