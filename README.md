@@ -15,5 +15,6 @@ python easy_generate_one_stroke.py --n 30 --seed 42 --family serpentine --outdir
 
 - [생성·분할 실행·설정·파일 역할](one_stroke_generator_tools/README.md)
 - [77 GHz 분석 근거와 EM 실행·반환 안내](one_stroke_generator_tools/EM_WORKFLOW.md)
+- [크기·경로를 제어한 배치 생성 (asym, mix)](batch_generator_tools/README.md)
 
 생성 GDS와 EM 결과는 Git에 포함하지 않는다. 압축·업로드도 자동 실행하지 않는다.
